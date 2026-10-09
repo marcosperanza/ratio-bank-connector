@@ -1,0 +1,23 @@
+# Binaries
+bank-connector
+bank-connector-sand
+bank-connector-*
+
+# Config with secrets (keep example)
+config/*.yaml
+config.yaml
+!config.yaml.example
+
+# Transaction data (local storage)
+data/
+
+# Private keys
+*.pem
+*.key
+
+# Environment
+.env
+.env.*
+
+# Go build cache
+vendor/
