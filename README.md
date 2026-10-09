@@ -1,5 +1,7 @@
 # Ratio Bank Connector
 
+Project website: https://www.ratio-fin.com · [Online user manual](https://www.ratio-fin.com/it/manual)
+
 Downloadable add-on for Ratio Web. It runs on the user’s computer, retrieves transactions from the user’s own open-banking application, and sends zero-knowledge encrypted envelopes to the user’s Ratio workspace. Enable Banking restricted mode is the first supported provider.
 
 ## How it works
