@@ -143,26 +143,26 @@ No additional Ably secret is stored in the connector configuration.
 
 ## Docker
 
-Docker is the recommended deployment for a Raspberry Pi or NAS. Create the configuration once with a writable mount, using a PEM file copied into `./config`:
+For a Raspberry Pi or NAS, build the Docker image locally from the source archive attached to the latest [GitHub Release](https://github.com/marcosperanza/ratio-bank-connector/releases). Extract the archive and run these commands from its directory. Create the configuration once with a writable mount, using a PEM file copied into `./config`:
 
 ```bash
 mkdir -p config data
 chmod 700 config data
 cp /secure/path/enable-banking.pem config/enable-banking.pem
+docker build -t ratio-bank-connector:local .
 docker run --rm -it \
   -v "$PWD/config:/app/config" \
-  ghcr.io/marcosperanza/ratio-bank-connector:latest \
+  ratio-bank-connector:local \
   setup-addon --config /app/config/config.yaml
 ```
 
-When prompted for the PEM path, enter `/app/config/enable-banking.pem`. Then start the hardened compose service:
+When prompted for the PEM path, enter `/app/config/enable-banking.pem`. Build the image and start the hardened compose service:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose up -d --build
 ```
 
-The configuration is mounted read-only during normal operation. The container has no Linux capabilities, uses a read-only root filesystem, restarts automatically, and exposes a local health check. The image is published for Linux amd64, arm64, and armv7.
+The compose file builds a local image for your machine. The configuration is mounted read-only during normal operation; the container has no Linux capabilities, uses a read-only root filesystem, restarts automatically, and exposes a local health check.
 
 ## Development checks
 

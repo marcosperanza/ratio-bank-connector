@@ -11,7 +11,7 @@ The connector can run continuously on a Raspberry Pi or NAS, or start automatica
 | Linux | amd64, arm64, armv7 | systemd user service |
 | macOS | Intel amd64, Apple Silicon arm64 | LaunchAgent |
 | Windows | amd64, arm64 | per-user Scheduled Task |
-| Docker | linux/amd64, linux/arm64, linux/arm/v7 | restart policy in Docker or Compose |
+| Docker | built locally for the host architecture (amd64, arm64, or arm/v7) | restart policy in Docker or Compose |
 
 The current release archives are a technical preview. They include checksums but are not yet signed with Apple Developer ID or Windows Authenticode certificates. Verify the checksum before running a downloaded binary.
 
@@ -170,7 +170,7 @@ Start-ScheduledTask -TaskName "Ratio Bank Connector"
 
 ## Docker installation for NAS and Raspberry Pi
 
-Docker is the recommended always-on installation. Create private configuration and data directories, then copy your PEM into the configuration directory:
+Docker is the recommended always-on installation. Download the latest source archive from [GitHub Releases](https://github.com/marcosperanza/ratio-bank-connector/releases), verify its `.sha256` checksum, extract it, and run the commands below from the extracted source directory. The archive includes the Dockerfile and required third-party source notices. Create private configuration and data directories, then copy your PEM into the configuration directory:
 
 ```bash
 mkdir -p config data
@@ -179,12 +179,13 @@ cp /secure/path/enable-banking.pem config/enable-banking.pem
 chmod 600 config/enable-banking.pem
 ```
 
-Run the interactive setup with a writable configuration mount:
+Build the image from the extracted source, then run the interactive setup with a writable configuration mount:
 
 ```bash
+docker build -t ratio-bank-connector:local .
 docker run --rm -it \
   -v "$PWD/config:/app/config" \
-  ghcr.io/marcosperanza/ratio-bank-connector:latest \
+  ratio-bank-connector:local \
   setup-addon --config /app/config/config.yaml
 ```
 
@@ -195,7 +196,8 @@ Create `compose.yaml` next to the `config` and `data` directories:
 ```yaml
 services:
   bank-connector:
-    image: ghcr.io/marcosperanza/ratio-bank-connector:latest
+    image: ratio-bank-connector:local
+    build: .
     volumes:
       - ./config:/app/config:ro
       - ./data:/app/data
@@ -218,13 +220,12 @@ services:
 Start and inspect the connector:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose up -d --build
 docker compose ps
 docker compose logs -f bank-connector
 ```
 
-The normal container mounts configuration read-only, runs with no Linux capabilities, and uses a read-only root filesystem. Its data directory remains writable for optional local archives and future durable state.
+Compose builds the image locally from the downloaded source. The normal container mounts configuration read-only, runs with no Linux capabilities, and uses a read-only root filesystem. Its data directory remains writable for optional local archives and future durable state.
 
 ## Link an account
 
@@ -296,8 +297,7 @@ The installers replace the executable and preserve the existing configuration an
 For Docker:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose up -d --build
 ```
 
 ## Uninstalling
