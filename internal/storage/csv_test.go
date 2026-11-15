@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/enablebanking"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/enablebanking"
 )
 
 func TestAppendTransactionsCanOmitRawProviderData(t *testing.T) {

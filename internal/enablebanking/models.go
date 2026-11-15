@@ -37,23 +37,23 @@ type Party struct {
 
 // Transaction represents a bank transaction from Enable Banking API.
 type Transaction struct {
-	EntryReference           string                 `json:"entry_reference,omitempty"`
-	BookingDate              string                 `json:"booking_date,omitempty"`
-	ValueDate                string                 `json:"value_date,omitempty"`
-	TransactionDate          string                 `json:"transaction_date,omitempty"`
-	TransactionAmount        TransactionAmount      `json:"transaction_amount"`
-	CreditDebitIndicator     string                 `json:"credit_debit_indicator,omitempty"` // "DBIT" | "CRDT"
-	Status                   string                 `json:"status,omitempty"`                 // "BOOK" | "PEND"
-	RemittanceInfo           []string               `json:"remittance_information,omitempty"`
-	Creditor                 *Party                 `json:"creditor,omitempty"`
-	CreditorAccount          *AccountIdentification `json:"creditor_account,omitempty"`
-	Debtor                   *Party                 `json:"debtor,omitempty"`
-	DebtorAccount            *AccountIdentification `json:"debtor_account,omitempty"`
-	MerchantCategoryCode     *string                `json:"merchant_category_code,omitempty"`
-	ReferenceNumber          *string                `json:"reference_number,omitempty"`
-	Note                     *string                `json:"note,omitempty"`
-	BalanceAfterTransaction  *TransactionAmount     `json:"balance_after_transaction,omitempty"`
-	TransactionID            string                 `json:"transaction_id,omitempty"`
+	EntryReference          string                 `json:"entry_reference,omitempty"`
+	BookingDate             string                 `json:"booking_date,omitempty"`
+	ValueDate               string                 `json:"value_date,omitempty"`
+	TransactionDate         string                 `json:"transaction_date,omitempty"`
+	TransactionAmount       TransactionAmount      `json:"transaction_amount"`
+	CreditDebitIndicator    string                 `json:"credit_debit_indicator,omitempty"` // "DBIT" | "CRDT"
+	Status                  string                 `json:"status,omitempty"`                 // "BOOK" | "PEND"
+	RemittanceInfo          []string               `json:"remittance_information,omitempty"`
+	Creditor                *Party                 `json:"creditor,omitempty"`
+	CreditorAccount         *AccountIdentification `json:"creditor_account,omitempty"`
+	Debtor                  *Party                 `json:"debtor,omitempty"`
+	DebtorAccount           *AccountIdentification `json:"debtor_account,omitempty"`
+	MerchantCategoryCode    *string                `json:"merchant_category_code,omitempty"`
+	ReferenceNumber         *string                `json:"reference_number,omitempty"`
+	Note                    *string                `json:"note,omitempty"`
+	BalanceAfterTransaction *TransactionAmount     `json:"balance_after_transaction,omitempty"`
+	TransactionID           string                 `json:"transaction_id,omitempty"`
 }
 
 // Description returns remittance_information joined as a single string.
@@ -191,4 +191,17 @@ type Session struct {
 	SessionID  string    `json:"session_id"`
 	Accounts   []Account `json:"accounts"`
 	ValidUntil time.Time `json:"valid_until"`
+	// Access is where the API reports the consent validity; ValidUntil above
+	// is kept for responses that carry it at the top level.
+	Access struct {
+		ValidUntil time.Time `json:"valid_until"`
+	} `json:"access"`
+}
+
+// Expires is when the consent ends, wherever the API put it.
+func (s Session) Expires() time.Time {
+	if !s.Access.ValidUntil.IsZero() {
+		return s.Access.ValidUntil
+	}
+	return s.ValidUntil
 }

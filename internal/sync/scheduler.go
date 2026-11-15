@@ -7,8 +7,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/ratio"
-	connectorrealtime "github.com/marcosperanza/ratio-bank-connector/v3/internal/realtime"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/ratio"
+	connectorrealtime "github.com/marcosperanza/ratio-bank-connector/v4/internal/realtime"
 	"go.uber.org/zap"
 )
 
@@ -17,10 +17,16 @@ import (
 // database, which on Neon then stays up for five minutes: keep it rare.
 const realtimeFallbackInterval = 60 * time.Minute
 
-// Used when realtime is unavailable. Above Neon's five-minute autosuspend,
-// so a connector without Ably does not keep the database awake around the
-// clock.
-const defaultOfflinePollSeconds = 600
+// Used when realtime is unavailable. Well above Neon's five-minute
+// autosuspend: at ten minutes the database was still up half of the time.
+const defaultOfflinePollSeconds = 1800
+
+// ably-go does not always recover by itself: when a token renewal is refused
+// (a 429 from the firewall, for one) the connection can stay disconnected for
+// good, and the daemon would poll at the offline rate until restarted. A
+// client that has been down this long is replaced on the next cycle; each
+// attempt costs one token request.
+const realtimeRestartAfter = 15 * time.Minute
 
 // RunDaemon runs SyncAll immediately, then every intervalHours until stopped.
 func RunDaemon(s *Syncer, intervalHours int, stop <-chan struct{}) {
@@ -30,7 +36,9 @@ func RunDaemon(s *Syncer, intervalHours int, stop <-chan struct{}) {
 	ticker := time.NewTicker(time.Duration(intervalHours) * time.Hour)
 	defer ticker.Stop()
 	s.log.Info("daemon started", zap.Int("interval_hours", intervalHours))
-	if err := s.SyncAll(); err != nil {
+	err := s.SyncAll()
+	s.reportCycle(err)
+	if err != nil {
 		s.log.Error("initial sync failed", zap.Error(err))
 	}
 	for {
@@ -39,7 +47,9 @@ func RunDaemon(s *Syncer, intervalHours int, stop <-chan struct{}) {
 			s.log.Info("daemon stopped")
 			return
 		case <-ticker.C:
-			if err := s.SyncAll(); err != nil {
+			err := s.SyncAll()
+			s.reportCycle(err)
+			if err != nil {
 				s.log.Error("sync failed", zap.Error(err))
 			}
 		}
@@ -67,16 +77,26 @@ func RunManagedDaemon(s *Syncer, pollIntervalSeconds, intervalHours int, stop <-
 	var realtimeCancel context.CancelFunc
 	var realtimeEvents <-chan connectorrealtime.Event
 	var realtimePresenceChannel string
+	realtimeConnected := false
+	// When the running client was last seen connected, or started; zero while connected.
+	var realtimeDownSince time.Time
 	startRealtime := func(pr *ratio.PollResponse) {
 		if pr == nil || pr.APIKeyID == "" {
 			return
 		}
-		if realtimeEvents != nil && pr.PresenceChannel == realtimePresenceChannel {
+		running := realtimeEvents != nil && pr.PresenceChannel == realtimePresenceChannel
+		if !realtimeNeedsStart(running, realtimeConnected, realtimeDownSince, time.Now()) {
 			return
+		}
+		if running {
+			s.log.Warn("realtime down too long, restarting the client",
+				zap.Duration("down_for", time.Since(realtimeDownSince)))
 		}
 		if realtimeCancel != nil {
 			realtimeCancel()
 		}
+		realtimeConnected = false
+		realtimeDownSince = time.Now()
 		ctx, cancel := context.WithCancel(context.Background())
 		events := make(chan connectorrealtime.Event, 8)
 		realtimeCancel = cancel
@@ -100,6 +120,7 @@ func RunManagedDaemon(s *Syncer, pollIntervalSeconds, intervalHours int, stop <-
 
 	runCycle := func(label string) {
 		pr, err := s.ManagedCycle()
+		s.reportCycle(err)
 		if err != nil {
 			s.log.Error(label, zap.Error(err))
 			return
@@ -108,7 +129,6 @@ func RunManagedDaemon(s *Syncer, pollIntervalSeconds, intervalHours int, stop <-
 	}
 
 	runCycle("initial managed cycle failed")
-	realtimeConnected := false
 	timer := time.NewTimer(offlineFallback)
 	defer timer.Stop()
 	resetTimer := func() {
@@ -131,6 +151,12 @@ func RunManagedDaemon(s *Syncer, pollIntervalSeconds, intervalHours int, stop <-
 			runCycle("managed fallback cycle failed")
 			resetTimer()
 		case event := <-realtimeEvents:
+			switch {
+			case event.Connected:
+				realtimeDownSince = time.Time{}
+			case realtimeConnected:
+				realtimeDownSince = time.Now()
+			}
 			realtimeConnected = event.Connected
 			if event.Terminal {
 				realtimeEvents = nil
@@ -142,6 +168,16 @@ func RunManagedDaemon(s *Syncer, pollIntervalSeconds, intervalHours int, stop <-
 			resetTimer()
 		}
 	}
+}
+
+// realtimeNeedsStart says whether a cycle should (re)start the realtime client:
+// none is running for the current channel, or the running one has been down
+// longer than realtimeRestartAfter.
+func realtimeNeedsStart(running, connected bool, downSince, now time.Time) bool {
+	if !running {
+		return true
+	}
+	return !connected && !downSince.IsZero() && now.Sub(downSince) >= realtimeRestartAfter
 }
 
 func managedPollInterval(realtimeConnected bool, offlineFallback time.Duration) time.Duration {

@@ -61,6 +61,19 @@ func DecryptGCM(ciphertext, iv, key []byte) ([]byte, error) {
 	return gcm.Open(nil, iv, ciphertext, nil)
 }
 
+// DecryptGCMWithAAD decrypts AES-256-GCM ciphertext bound to additional data.
+func DecryptGCMWithAAD(ciphertext, iv, key, aad []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return gcm.Open(nil, iv, ciphertext, aad)
+}
+
 // DecryptSearchKey decrypts encryptedSearchKey (encrypted with masterKey AES-GCM).
 // Browser format (wrapSearchKey): base64(IV[12] || AES-GCM-ciphertext)
 func DecryptSearchKey(encryptedSearchKeyB64 string, masterKey []byte) ([]byte, error) {

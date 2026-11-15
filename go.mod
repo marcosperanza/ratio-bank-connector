@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Marco Speranza.
 // SPDX-License-Identifier: AGPL-3.0-only
 
-module github.com/marcosperanza/ratio-bank-connector/v3
+module github.com/marcosperanza/ratio-bank-connector/v4
 
 go 1.22.0
 

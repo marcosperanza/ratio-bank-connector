@@ -21,3 +21,7 @@ data/
 
 # Go build cache
 vendor/
+
+# Build output
+dist/
+macos/.build/

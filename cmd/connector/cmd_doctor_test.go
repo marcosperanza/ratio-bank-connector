@@ -34,13 +34,15 @@ func TestNormalizeInputPath(t *testing.T) {
 	}
 }
 
-func TestSetupAddonKeepsManagedAlias(t *testing.T) {
+func TestSetupKeepsAddonAliases(t *testing.T) {
 	t.Parallel()
-	cmd := cmdSetupManaged()
-	if cmd.Name() != "setup-addon" {
-		t.Fatalf("expected setup-addon command, got %q", cmd.Name())
+	cmd := cmdSetupWizard()
+	if cmd.Name() != "setup" {
+		t.Fatalf("expected setup command, got %q", cmd.Name())
 	}
-	if !cmd.HasAlias("setup-managed") {
-		t.Fatal("expected setup-managed backward-compatible alias")
+	for _, alias := range []string{"setup-addon", "setup-managed"} {
+		if !cmd.HasAlias(alias) {
+			t.Fatalf("expected backward-compatible alias %s", alias)
+		}
 	}
 }

@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/enablebanking"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/enablebanking"
 )
 
 var csvHeaders = []string{

@@ -31,6 +31,19 @@ type APIError struct {
 	Method     string
 	Path       string
 	StatusCode int
+	// Body is the provider's explanation, truncated. It is not part of Error():
+	// that text reaches logs and Ratio. Local screens (settings page, terminal)
+	// may show it through Detail.
+	Body string
+}
+
+// Detail returns the provider's own explanation of a failed call, or "".
+func Detail(err error) string {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return strings.TrimSpace(apiErr.Body)
+	}
+	return ""
 }
 
 func (e *APIError) Error() string {
@@ -143,7 +156,12 @@ func (c *Client) do(method, path string, body any, out any) error {
 
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return &APIError{Method: method, Path: path, StatusCode: resp.StatusCode}
+		debugProviderError(method, path, resp.StatusCode, data)
+		body := data
+		if len(body) > 500 {
+			body = body[:500]
+		}
+		return &APIError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: string(body)}
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -151,6 +169,19 @@ func (c *Client) do(method, path string, body any, out any) error {
 		}
 	}
 	return nil
+}
+
+// debugProviderError prints a provider error body to the local stderr when
+// RATIO_CONNECTOR_DEBUG_PROVIDER_ERRORS=1. It is off by default and never
+// reaches logs or Ratio status data, which stay free of provider bodies.
+func debugProviderError(method, path string, status int, body []byte) {
+	if os.Getenv("RATIO_CONNECTOR_DEBUG_PROVIDER_ERRORS") != "1" {
+		return
+	}
+	if len(body) > 2048 {
+		body = body[:2048]
+	}
+	fmt.Fprintf(os.Stderr, "[debug] enable banking %s %s -> HTTP %d: %s\n", method, path, status, body)
 }
 
 // doDouble reads the response body once and unmarshals into two targets.

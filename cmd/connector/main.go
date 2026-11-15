@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -12,16 +13,22 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"golang.org/x/term"
 
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/config"
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/crypto"
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/enablebanking"
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/ratio"
-	syncp "github.com/marcosperanza/ratio-bank-connector/v3/internal/sync"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/config"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/crypto"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/ebauth"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/enablebanking"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/ratio"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/source/eblocal"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/source/foldersource"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/source/simplefinsource"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/status"
+	syncp "github.com/marcosperanza/ratio-bank-connector/v4/internal/sync"
 )
 
 var (
@@ -49,7 +56,7 @@ func main() {
 	}
 
 	root.PersistentFlags().StringVarP(&cfgPath, "config", "c", config.DefaultConfigPath(), "config file path")
-	root.AddCommand(cmdSetup(), cmdSetupManaged(), cmdSync(), cmdLink(), cmdAccounts(), cmdDoctor(), cmdVersion())
+	root.AddCommand(cmdSetupWizard(), cmdSetup(), cmdService(), cmdUI(), cmdSync(), cmdLink(), cmdSessions(), cmdAccounts(), cmdSimpleFINClaim(), cmdSetupSimpleFIN(), cmdDoctor(), cmdPrices(), cmdVersion())
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -71,7 +78,7 @@ func cmdSync() *cobra.Command {
 				return err
 			}
 
-			s := syncp.New(cfg, cfgPath, ebClient, ratioClient, masterKey, searchKey, log)
+			s := newSyncer(cfg, ebClient, ratioClient, masterKey, searchKey)
 
 			if !daemon {
 				if force {
@@ -80,6 +87,13 @@ func cmdSync() *cobra.Command {
 				return s.SyncAll()
 			}
 
+			tracker := status.NewTracker(statusPath(), version)
+			s.OnCycle = tracker.BankCycle
+			hbCtx, hbCancel := context.WithCancel(context.Background())
+			defer hbCancel()
+			go tracker.Heartbeat(hbCtx, 30*time.Second)
+			defer tracker.Stop()
+
 			stop := make(chan struct{})
 			sig := make(chan os.Signal, 1)
 			signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -87,6 +101,20 @@ func cmdSync() *cobra.Command {
 				<-sig
 				close(stop)
 			}()
+			if cfg.Prices.Enabled {
+				engine, source, err := buildPriceEngine(cfg)
+				if err != nil {
+					return err
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				go func() {
+					<-stop
+					cancel()
+				}()
+				engine.OnRun = tracker.PricesRun
+				go engine.RunLoop(ctx, source, time.Duration(cfg.Prices.IntervalHours)*time.Hour)
+			}
 			if cfg.Mode == "ratio_managed" {
 				syncp.RunManagedDaemon(s, cfg.RatioManaged.PollIntervalSeconds, cfg.Sync.IntervalHours, stop)
 			} else {
@@ -98,6 +126,25 @@ func cmdSync() *cobra.Command {
 	cmd.Flags().BoolVar(&daemon, "daemon", false, "run continuously on interval")
 	cmd.Flags().BoolVar(&force, "force", false, "ignore the last successful sync time for this manual run")
 	return cmd
+}
+
+// newSyncer builds the syncer with every source this machine is set up for. Enable Banking serves the accounts Ratio
+// links itself; `enablebanking-local` serves those whose consent was given on this machine with the same credentials.
+func newSyncer(cfg *config.Config, ebClient *enablebanking.Client, ratioClient *ratio.Client, masterKey, searchKey []byte) *syncp.Syncer {
+	var s *syncp.Syncer
+	if ebClient != nil {
+		s = syncp.New(cfg, cfgPath, ebClient, ratioClient, masterKey, searchKey, log)
+		s.RegisterSource(eblocal.New(ebClient, &ebauth.Store{Path: config.EBSessionsPath()}, log))
+	} else {
+		s = syncp.New(cfg, cfgPath, nil, ratioClient, masterKey, searchKey, log)
+	}
+	if len(cfg.Folders) > 0 {
+		s.RegisterSource(foldersource.New(folderAccounts(cfg)))
+	}
+	if len(cfg.SimpleFIN) > 0 {
+		s.RegisterSource(simplefinsource.New(simplefinAccounts(cfg, os.Getenv)))
+	}
+	return s
 }
 
 func cmdAccounts() *cobra.Command {
@@ -147,13 +194,18 @@ func loadRuntime() (*config.Config, *enablebanking.Client, *ratio.Client, []byte
 		return nil, nil, nil, nil, nil, fmt.Errorf("load config: %w", err)
 	}
 
-	ebClient, err := enablebanking.NewClient(
-		cfg.EnableBanking.AppID,
-		cfg.EnableBanking.PrivateKeyPath,
-		cfg.EnableBanking.PrivateKeyB64,
-	)
-	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("enable banking client: %w", err)
+	var ebClient *enablebanking.Client
+	// In ratio_managed mode Enable Banking is optional: a connector that reads
+	// folders or SimpleFIN has no bank credentials of its own.
+	if cfg.Mode != "ratio_managed" || cfg.EnableBankingConfigured() {
+		ebClient, err = enablebanking.NewClient(
+			cfg.EnableBanking.AppID,
+			cfg.EnableBanking.PrivateKeyPath,
+			cfg.EnableBanking.PrivateKeyB64,
+		)
+		if err != nil {
+			return nil, nil, nil, nil, nil, fmt.Errorf("enable banking client: %w", err)
+		}
 	}
 
 	// ratio_managed: build client using API key — ZK keys resolved later from poll response
@@ -237,4 +289,66 @@ func normalizeInputPath(raw string) (string, error) {
 		return "", fmt.Errorf("resolve path: %w", err)
 	}
 	return filepath.Clean(abs), nil
+}
+
+// folderAccounts turns the configured folders into what the folder source reads.
+func folderAccounts(cfg *config.Config) map[string]foldersource.Account {
+	out := make(map[string]foldersource.Account, len(cfg.Folders))
+	for _, f := range cfg.Folders {
+		out[f.Account] = foldersource.Account{
+			Dir:    f.Path,
+			Format: f.Format,
+			Profile: foldersource.Profile{
+				Delimiter: f.Profile.Delimiter, SkipRows: f.Profile.SkipRows, Encoding: f.Profile.Encoding,
+				DateLayout: f.Profile.DateLayout, Columns: f.Profile.Columns,
+				Decimal: f.Profile.Decimal, Thousands: f.Profile.Thousands, Currency: f.Profile.Currency,
+			},
+		}
+	}
+	return out
+}
+
+// simplefinAccounts turns the configured SimpleFIN accounts into what the
+// source reads. An access URL named by an environment variable wins over one
+// written in the file; an entry with neither is left out and reported unconfigured.
+func simplefinAccounts(cfg *config.Config, getenv func(string) string) map[string]simplefinsource.Account {
+	out := make(map[string]simplefinsource.Account, len(cfg.SimpleFIN))
+	for _, a := range cfg.SimpleFIN {
+		if a.Account == "" { // a saved connection waiting for an account to map
+			continue
+		}
+		access := a.AccessURL
+		if a.AccessURLEnv != "" {
+			if v := getenv(a.AccessURLEnv); v != "" {
+				access = v
+			}
+		}
+		out[a.Account] = simplefinsource.Account{AccessURL: access, ID: a.SFINAccount}
+	}
+	return out
+}
+
+// cmdSimpleFINClaim exchanges a SimpleFIN setup token for the access URL the
+// connector uses. The token works once; the URL is printed for the user to
+// store as a secret, never written by the connector.
+func cmdSimpleFINClaim() *cobra.Command {
+	return &cobra.Command{
+		Use:   "simplefin-claim <setup-token>",
+		Short: "Exchange a SimpleFIN setup token for an access URL",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			access, err := simplefinsource.Claim(nil, args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Println(access)
+			fmt.Fprintln(os.Stderr, "Keep this URL secret: it reads your accounts. Set it as an environment variable and name that variable in the config (access_url_env).")
+			return nil
+		},
+	}
+}
+
+// statusPath is where the daemon publishes its state for the tray and UI.
+func statusPath() string {
+	return filepath.Join(config.DefaultDataDir(), "status.json")
 }

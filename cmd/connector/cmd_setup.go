@@ -20,8 +20,8 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/config"
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/crypto"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/config"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/crypto"
 )
 
 type ratioAuthResponse struct {
@@ -40,8 +40,8 @@ var setupHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 func cmdSetup() *cobra.Command {
 	return &cobra.Command{
-		Use:   "setup",
-		Short: "Interactive wizard — creates config.yaml",
+		Use:   "setup-standalone",
+		Short: "Legacy standalone wizard (own passphrase, no Ratio add-on) — creates config.yaml",
 		Long:  `Guides you through creating config.yaml with Enable Banking credentials and optional Ratio push.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r := bufio.NewReader(os.Stdin)

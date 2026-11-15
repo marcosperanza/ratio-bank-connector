@@ -5,30 +5,63 @@ package sync
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"go.uber.org/zap"
 
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/config"
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/crypto"
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/enablebanking"
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/ratio"
-	"github.com/marcosperanza/ratio-bank-connector/v3/internal/storage"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/config"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/crypto"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/enablebanking"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/ratio"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/source"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/source/ebsource"
+	"github.com/marcosperanza/ratio-bank-connector/v4/internal/storage"
 )
 
 // Syncer orchestrates EB → CSV → [Ratio inbox].
 type Syncer struct {
-	cfg          *config.Config
-	cfgPath      string
-	ebClient     bankClient
+	cfg      *config.Config
+	cfgPath  string
+	ebClient bankClient
+	// sources serve the accounts of managed mode by provider name; linkers
+	// handle the approval step for the providers that have one.
+	sources      map[string]source.Source
+	linkers      map[string]source.Linker
 	ratioClient  inboxClient
 	masterKey    []byte // standalone mode only (AES symmetric, legacy)
 	searchKey    []byte // standalone mode only
 	publicKeyJwk string // ratio_managed mode (RSA hybrid encryption)
 	log          *zap.Logger
+	reportHook   func([]ratio.StatusUpdate) error // test seam for ReportUpdates
+
+	// OnCycle, when set, receives the outcome of every daemon cycle (for the
+	// status file the tray and settings UI read).
+	OnCycle func(err error)
+}
+
+func (s *Syncer) reportUpdates(rm config.RatioManagedConfig, updates []ratio.StatusUpdate) error {
+	if s.reportHook != nil {
+		return s.reportHook(updates)
+	}
+	return ratio.ReportUpdates(rm.URL, rm.APIKey, updates)
+}
+
+func (s *Syncer) reportCycle(err error) {
+	if s.OnCycle != nil {
+		s.OnCycle(err)
+	}
+}
+
+// watchSources lets the sources that have something to say between syncs say it.
+func (s *Syncer) watchSources(now time.Time) {
+	for _, src := range s.sources {
+		if w, ok := src.(source.Watcher); ok {
+			w.Watch(now)
+		}
+	}
 }
 
 type bankClient interface {
@@ -51,15 +84,45 @@ func New(
 	searchKey []byte,
 	log *zap.Logger,
 ) *Syncer {
-	return &Syncer{
+	s := &Syncer{
 		cfg:         cfg,
 		cfgPath:     cfgPath,
 		ebClient:    ebClient,
+		sources:     map[string]source.Source{},
+		linkers:     map[string]source.Linker{},
 		ratioClient: ratioClient,
 		masterKey:   masterKey,
 		searchKey:   searchKey,
 		log:         log,
 	}
+	// A connector that only reads files or SimpleFIN has no Enable Banking
+	// credentials; accounts that name that provider are then reported as
+	// unknown instead of failing on a nil client.
+	if ebClient != nil {
+		s.sources[DefaultProvider] = ebsource.New(ebClient)
+		s.linkers[DefaultProvider] = ebsource.NewLinker(ebClient)
+	}
+	return s
+}
+
+// DefaultProvider serves accounts whose provider the server leaves unnamed.
+const DefaultProvider = "enablebanking"
+
+// RegisterSource adds a provider. A source that is also a source.Linker
+// takes part in the approval step; one that is a source.Local is ready once
+// configured on this machine.
+func (s *Syncer) RegisterSource(src source.Source) {
+	s.sources[src.Name()] = src
+	if l, ok := src.(source.Linker); ok {
+		s.linkers[src.Name()] = l
+	}
+}
+
+func providerName(acc ratio.RemoteBankAccount) string {
+	if acc.Provider == "" {
+		return DefaultProvider
+	}
+	return acc.Provider
 }
 
 // SyncAll runs one sync cycle.
@@ -109,6 +172,7 @@ func (s *Syncer) ManagedCycle() (*ratio.PollResponse, error) {
 }
 
 func (s *Syncer) managedCycle(force bool, now time.Time) (*ratio.PollResponse, error) {
+	s.watchSources(now)
 	pr, err := s.fetchManagedConfig()
 	if err != nil {
 		return nil, err
@@ -201,11 +265,26 @@ func (s *Syncer) pollCycle(pr *ratio.PollResponse) error {
 				acc.PendingAuthCode = ""
 			}
 
-		case ratio.StatusExpired:
-			s.log.Warn("bank account session expired, re-link needed",
-				zap.String("id", acc.ID),
-				zap.String("bank", acc.BankName),
-			)
+		case ratio.StatusExpired, ratio.StatusError:
+			if m, ok := s.sources[providerName(*acc)].(source.Matcher); ok && acc.EBAccountID == "" {
+				// The user renews the consent on this machine; pick it up
+				// without asking for a click in Ratio.
+				if upd, err := s.matchLocal(m, *acc); err == nil {
+					updates = append(updates, *upd)
+					acc.Status = ratio.StatusLinked
+					acc.EBAccountID = upd.EBAccountID
+					acc.SessionValidUntil = upd.SessionValidUntil
+				} else {
+					s.log.Info("waiting for a local authorization", zap.String("id", acc.ID), zap.String("reason", err.Error()))
+				}
+				break
+			}
+			if acc.Status == ratio.StatusExpired {
+				s.log.Warn("bank account session expired, re-link needed",
+					zap.String("id", acc.ID),
+					zap.String("bank", acc.BankName),
+				)
+			}
 		}
 	}
 
@@ -220,7 +299,7 @@ func (s *Syncer) pollCycle(pr *ratio.PollResponse) error {
 	}
 
 	if len(updates) > 0 {
-		if err := ratio.ReportUpdates(rm.URL, rm.APIKey, updates); err != nil {
+		if err := s.reportUpdates(rm, updates); err != nil {
 			return fmt.Errorf("report control updates: %w", err)
 		}
 	}
@@ -311,41 +390,74 @@ func accountSyncDue(lastSyncAt, lastSyncAttemptAt string, intervalHours int, now
 	return !now.Before(next), next
 }
 
-// handlePending: generate OAuth URL, return AUTH_URL update.
+// handlePending starts a pending account: an approval address for providers
+// that need one, immediate readiness for the ones that only need a setting here.
 func (s *Syncer) handlePending(acc ratio.RemoteBankAccount, ratioURL string) (*ratio.StatusUpdate, error) {
-	cbURL := strings.TrimRight(ratioURL, "/") + "/api/connector/eb-callback"
-	authURL, err := s.ebClient.InitAuth(acc.BankName, acc.Country, cbURL, acc.ID)
-	if err != nil {
-		return nil, fmt.Errorf("init auth for %s: %w", acc.BankName, err)
+	name := providerName(acc)
+	if m, ok := s.sources[name].(source.Matcher); ok {
+		return s.matchLocal(m, acc)
 	}
-	s.log.Info("generated auth URL for pending account",
-		zap.String("id", acc.ID),
-		zap.String("bank", acc.BankName),
-	)
-	upd := ratio.AuthURLUpdate(acc.ID, authURL)
+	if linker, ok := s.linkers[name]; ok {
+		url, err := linker.Begin(s.linkRequest(acc, ratioURL))
+		if err != nil {
+			return nil, err
+		}
+		s.log.Info("generated auth URL for pending account",
+			zap.String("id", acc.ID),
+			zap.String("bank", acc.BankName),
+			zap.String("provider", name),
+		)
+		upd := ratio.AuthURLUpdate(acc.ID, url)
+		return &upd, nil
+	}
+	src, ok := s.sources[name]
+	if !ok {
+		return nil, fmt.Errorf("this connector does not support the %q provider", name)
+	}
+	local, ok := src.(source.Local)
+	if !ok {
+		return nil, fmt.Errorf("the %q provider cannot be linked from this connector", name)
+	}
+	if !local.Configured(acc.ID) {
+		return nil, fmt.Errorf("this computer has no setting for the account %q: add it to the connector configuration", acc.DisplayName)
+	}
+	upd := ratio.SessionCreatedUpdate(acc.ID, acc.ID, "", "", time.Time{})
 	return &upd, nil
 }
 
-// handleLinking: create EB session from pending auth code, return SESSION_CREATED update.
-func (s *Syncer) handleLinking(acc ratio.RemoteBankAccount) (*ratio.StatusUpdate, error) {
-	session, err := s.ebClient.CreateSession(acc.PendingAuthCode)
+// matchLocal links an account to an approval the user gave on this computer.
+func (s *Syncer) matchLocal(m source.Matcher, acc ratio.RemoteBankAccount) (*ratio.StatusUpdate, error) {
+	req := s.linkRequest(acc, "")
+	res, err := m.Match(req)
 	if err != nil {
-		return nil, fmt.Errorf("create session: %w", err)
+		return nil, err
 	}
-	var ebAccountID, iban, currency string
-	if len(session.Accounts) > 0 {
-		a := session.Accounts[0]
-		ebAccountID = a.ID
-		iban = a.AccountID.IBAN
-		currency = a.Currency
+	upd := ratio.SessionCreatedUpdate(acc.ID, res.Ref, res.IBAN, res.Currency, res.ValidUntil)
+	return &upd, nil
+}
+
+// handleLinking completes an approval the user gave in the browser.
+func (s *Syncer) handleLinking(acc ratio.RemoteBankAccount) (*ratio.StatusUpdate, error) {
+	name := providerName(acc)
+	linker, ok := s.linkers[name]
+	if !ok {
+		return nil, fmt.Errorf("this connector does not support the %q provider", name)
+	}
+	res, err := linker.Complete(s.linkRequest(acc, ""), acc.PendingAuthCode)
+	if err != nil {
+		return nil, err
 	}
 	s.log.Info("session created for account",
 		zap.String("id", acc.ID),
-		zap.String("ebAccountId", ebAccountID),
-		zap.String("iban", maskIBAN(iban)),
+		zap.String("ebAccountId", res.Ref),
+		zap.String("iban", maskIBAN(res.IBAN)),
 	)
-	upd := ratio.SessionCreatedUpdate(acc.ID, ebAccountID, iban, currency, session.ValidUntil)
+	upd := ratio.SessionCreatedUpdate(acc.ID, res.Ref, res.IBAN, res.Currency, res.ValidUntil)
 	return &upd, nil
+}
+
+func (s *Syncer) linkRequest(acc ratio.RemoteBankAccount, ratioURL string) source.LinkRequest {
+	return source.LinkRequest{AccountID: acc.ID, AccountName: acc.DisplayName, BankName: acc.BankName, Country: acc.Country, RatioURL: ratioURL}
 }
 
 // syncRemoteAccount syncs a LINKED remote account. Returns status update(s).
@@ -370,9 +482,13 @@ func (s *Syncer) syncRemoteAccount(acc ratio.RemoteBankAccount) []ratio.StatusUp
 		zap.String("from", dateFrom),
 	)
 
-	txs, rawTxs, err := s.ebClient.GetTransactions(acc.EBAccountID, dateFrom)
+	src, ok := s.sources[providerName(acc)]
+	if !ok {
+		return []ratio.StatusUpdate{ratio.SyncErrorUpdate(acc.ID, fmt.Sprintf("this connector does not support the %q provider", providerName(acc)))}
+	}
+	fetched, err := src.Fetch(source.Request{Account: acc.EBAccountID, From: dateFrom})
 	if err != nil {
-		if isSessionExpiredError(err) {
+		if errors.Is(err, source.ErrAuthExpired) {
 			s.log.Warn("EB session expired during sync, requesting re-link",
 				zap.String("id", acc.ID),
 				zap.String("bank", acc.BankName),
@@ -383,12 +499,13 @@ func (s *Syncer) syncRemoteAccount(acc ratio.RemoteBankAccount) []ratio.StatusUp
 		s.log.Error("sync failed", zap.String("id", acc.ID), zap.Error(err))
 		return []ratio.StatusUpdate{ratio.SyncErrorUpdate(acc.ID, errMsg)}
 	}
+	txs := fetched.Transactions
 
 	appended := len(txs)
 	archiveMode := s.cfg.EffectiveArchiveMode()
-	if archiveMode != config.ArchiveOff {
+	if archiveMode != config.ArchiveOff && fetched.Archive != nil {
 		includeRaw := archiveMode == config.ArchiveCSVAndRaw
-		appended, err = storage.AppendTransactionsWithOptions(s.cfg.Sync.CSVDir, acc.EBAccountID, txs, rawTxs, includeRaw)
+		appended, err = fetched.Archive(s.cfg.Sync.CSVDir, acc.EBAccountID, includeRaw)
 		if err != nil {
 			errMsg := fmt.Sprintf("write local archive: %s", err)
 			s.log.Error("local archive write failed", zap.String("id", acc.ID), zap.Error(err))
@@ -405,11 +522,7 @@ func (s *Syncer) syncRemoteAccount(acc ratio.RemoteBankAccount) []ratio.StatusUp
 		if s.publicKeyJwk == "" {
 			return []ratio.StatusUpdate{ratio.SyncErrorUpdate(acc.ID, "Ratio encryption public key is unavailable")}
 		}
-		fakeAcc := &config.AccountConfig{
-			EBAccountID:      acc.EBAccountID,
-			RatioWorkspaceID: acc.WorkspaceID,
-		}
-		items, err := s.buildInboxItemsRSA(txs, fakeAcc)
+		items, err := s.buildInboxItemsRSA(txs)
 		if err != nil {
 			s.log.Error("inbox encryption failed", zap.String("id", acc.ID), zap.Error(err))
 			return []ratio.StatusUpdate{ratio.SyncErrorUpdate(acc.ID, "encrypt transactions for Ratio inbox")}
@@ -530,21 +643,18 @@ func (s *Syncer) buildInboxItems(txs []enablebanking.Transaction, acc *config.Ac
 
 // buildInboxItemsRSA encrypts transactions using RSA hybrid encryption (ratio_managed mode).
 // No passphrase or master key required — uses the user's RSA public key from poll.
-func (s *Syncer) buildInboxItemsRSA(txs []enablebanking.Transaction, acc *config.AccountConfig) ([]ratio.InboxItem, error) {
+func (s *Syncer) buildInboxItemsRSA(txs []source.Transaction) ([]ratio.InboxItem, error) {
 	var items []ratio.InboxItem
 	for _, tx := range txs {
-		amount, _ := strconv.ParseFloat(tx.TransactionAmount.Amount, 64)
-		if tx.CreditDebitIndicator == "DBIT" {
-			amount = -amount
+		if err := tx.Validate(); err != nil {
+			return nil, err
 		}
-		desc := tx.Description()
-		creditorName := tx.CreditorName()
 		blob := crypto.TransactionBlob{
-			Description:  desc,
-			MerchantName: creditorName,
-			Amount:       amount,
-			Currency:     tx.TransactionAmount.Currency,
-			IBAN:         tx.CreditorIBAN(),
+			Description:  tx.Description,
+			MerchantName: tx.Counterparty,
+			Amount:       tx.Amount,
+			Currency:     tx.Currency,
+			IBAN:         tx.CounterpartyIBAN,
 		}
 
 		encSessionKey, encBlob, encIV, err := crypto.EncryptBlobHybrid(s.publicKeyJwk, blob)
@@ -554,28 +664,15 @@ func (s *Syncer) buildInboxItemsRSA(txs []enablebanking.Transaction, acc *config
 
 		bookingDate, _ := time.Parse("2006-01-02", tx.BookingDate)
 
-		bankTxID := tx.EntryReference
-		if bankTxID == "" {
-			bankTxID = tx.TransactionID
-		}
-		if bankTxID == "" {
-			bankTxID = fmt.Sprintf("%s_%s_%s", tx.BookingDate, tx.TransactionAmount.Amount, desc)
-		}
-
 		items = append(items, ratio.InboxItem{
 			EncryptedBlob:       encBlob,
 			EncryptionIV:        encIV,
 			EncryptedSessionKey: encSessionKey,
-			BankTransactionID:   bankTxID,
+			BankTransactionID:   tx.ID,
 			BookingDate:         bookingDate,
 		})
 	}
 	return items, nil
-}
-
-// isSessionExpiredError detects EB 401/403 responses that indicate session expiry.
-func isSessionExpiredError(err error) bool {
-	return enablebanking.IsAuthorizationError(err)
 }
 
 func maskIBAN(iban string) string {

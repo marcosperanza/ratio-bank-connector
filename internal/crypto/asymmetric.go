@@ -84,3 +84,29 @@ func EncryptBlobHybrid(publicKeyJwk string, blob TransactionBlob) (encryptedSess
 
 	return encryptedSessionKey, encryptedBlob, encryptionIv, nil
 }
+
+// EncryptJSONHybrid seals any JSON value to a user's public key with the same hybrid scheme as the transaction
+// blobs: the device opens it with `hybridDecrypt`. The plaintext is returned too, so the caller can hash it.
+func EncryptJSONHybrid(publicKeyJwk string, value any) (encryptedSessionKey, encryptedBlob, encryptionIv string, plaintext []byte, err error) {
+	pub, err := ParseRSAPublicKeyJWK(publicKeyJwk)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	plaintext, err = json.Marshal(value)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	sessionKey := make([]byte, 32)
+	if _, err = rand.Read(sessionKey); err != nil {
+		return "", "", "", nil, err
+	}
+	encryptedSessionKey, err = EncryptSessionKeyRSA(pub, sessionKey)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	encryptedBlob, encryptionIv, err = EncryptForStorage(plaintext, sessionKey)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	return encryptedSessionKey, encryptedBlob, encryptionIv, plaintext, nil
+}

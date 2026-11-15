@@ -4,6 +4,30 @@ Ratio Bank Connector is a free local add-on for Ratio Web. It runs on a computer
 
 The connector can run continuously on a Raspberry Pi or NAS, or start automatically when you log in to Linux, macOS, or Windows. When a computer has been offline, the connector checks Ratio's remote sync state and catches up only when the configured interval has elapsed.
 
+## Quick start (recommended)
+
+Every platform has a guided setup that checks each step live (Ratio key, Enable Banking key, price-provider keys) and installs the background service. The configuration it writes is described in [CONFIGURATION.md](CONFIGURATION.md).
+
+| Platform | Install | Configure |
+|---|---|---|
+| macOS | Open `RatioConnector-<version>.dmg`, drag **Ratio Connector** to Applications, open it | The first launch opens the settings page; press **Install and start**. A menu bar icon shows the status |
+| Linux / Windows | Extract the release archive | `bank-connector setup` (terminal) or `bank-connector ui` (browser page), then `bank-connector service install` |
+| Docker (NAS, Raspberry Pi) | Extract the source archive, then `docker compose --profile setup run --rm setup` and `docker compose up -d --build` | Builds the image locally; the same setup command configures it again later |
+
+The commands behind it:
+
+```bash
+bank-connector setup              # guided setup in the terminal (also: setup-addon)
+bank-connector ui                 # same settings in a browser page, on 127.0.0.1 only
+bank-connector service install    # per-user service that starts at login
+bank-connector service status|restart|uninstall
+bank-connector doctor --network   # check everything, including the providers
+```
+
+You can combine Enable Banking, SimpleFIN and CSV folders in one connector, and add price downloads. SimpleFIN and folders are set with `bank-connector setup-simplefin` and in the configuration file ([PROVIDERS.md](PROVIDERS.md)); Enable Banking on this machine is in [ENABLEBANKING_LOCAL.md](ENABLEBANKING_LOCAL.md) and prices in [PRICES.md](PRICES.md). The full file is described in [CONFIGURATION.md](CONFIGURATION.md).
+
+The sections below describe the manual, script-based installation, which still works.
+
 ## Supported platforms
 
 | Platform | Architectures | Background agent |
@@ -11,7 +35,7 @@ The connector can run continuously on a Raspberry Pi or NAS, or start automatica
 | Linux | amd64, arm64, armv7 | systemd user service |
 | macOS | Intel amd64, Apple Silicon arm64 | LaunchAgent |
 | Windows | amd64, arm64 | per-user Scheduled Task |
-| Docker | built locally for the host architecture (amd64, arm64, or arm/v7) | restart policy in Docker or Compose |
+| Docker | linux/amd64, linux/arm64, linux/arm/v7 | restart policy in Docker or Compose |
 
 The current release archives are a technical preview. They include checksums but are not yet signed with Apple Developer ID or Windows Authenticode certificates. Verify the checksum before running a downloaded binary.
 
@@ -98,7 +122,7 @@ The setup wizard asks for:
 - your personal Ratio connector API key;
 - your Enable Banking App ID;
 - the absolute path to your PEM private key;
-- the fallback poll interval: the default is 600 seconds (10 minutes).
+- the fallback poll interval: the default is 1800 seconds (30 minutes).
 
 The connector starts immediately and starts again at each login. Check its status and logs with:
 
@@ -170,7 +194,7 @@ Start-ScheduledTask -TaskName "Ratio Bank Connector"
 
 ## Docker installation for NAS and Raspberry Pi
 
-Docker is the recommended always-on installation. Download the latest source archive from [GitHub Releases](https://github.com/marcosperanza/ratio-bank-connector/releases), verify its `.sha256` checksum, extract it, and run the commands below from the extracted source directory. The archive includes the Dockerfile and required third-party source notices. Create private configuration and data directories, then copy your PEM into the configuration directory:
+Docker is the recommended always-on installation. Create private configuration and data directories, then copy your PEM into the configuration directory:
 
 ```bash
 mkdir -p config data
@@ -179,10 +203,9 @@ cp /secure/path/enable-banking.pem config/enable-banking.pem
 chmod 600 config/enable-banking.pem
 ```
 
-Build the image from the extracted source, then run the interactive setup with a writable configuration mount:
+Run the interactive setup with a writable configuration mount:
 
 ```bash
-docker build -t ratio-bank-connector:local .
 docker run --rm -it \
   -v "$PWD/config:/app/config" \
   ratio-bank-connector:local \
@@ -197,7 +220,6 @@ Create `compose.yaml` next to the `config` and `data` directories:
 services:
   bank-connector:
     image: ratio-bank-connector:local
-    build: .
     volumes:
       - ./config:/app/config:ro
       - ./data:/app/data
@@ -225,7 +247,7 @@ docker compose ps
 docker compose logs -f bank-connector
 ```
 
-Compose builds the image locally from the downloaded source. The normal container mounts configuration read-only, runs with no Linux capabilities, and uses a read-only root filesystem. Its data directory remains writable for optional local archives and future durable state.
+The normal container mounts configuration read-only, runs with no Linux capabilities, and uses a read-only root filesystem. Its data directory remains writable for optional local archives and future durable state.
 
 ## Link an account
 

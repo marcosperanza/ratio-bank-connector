@@ -28,7 +28,10 @@ const (
 
 // RemoteBankAccount is one account slot from GET /api/connector/poll.
 type RemoteBankAccount struct {
-	ID                string            `json:"id"`
+	ID string `json:"id"`
+	// Provider names the source that serves the account. Empty means Enable
+	// Banking: servers that predate other providers do not send it.
+	Provider          string            `json:"provider"`
 	EBAccountID       string            `json:"ebAccountId"`
 	WorkspaceID       string            `json:"workspaceId"`
 	BankName          string            `json:"bankName"`
